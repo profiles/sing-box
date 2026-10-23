@@ -1,0 +1,102 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/SagerNet/sing-box.git
+  BRANCH: stable
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new_tag: ${{ steps.check.outputs.new_tag }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
+    steps:
+      - name: Check out (${{ env.BRANCH }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch origin + upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          # 对齐最新远程;显式 refspec 才会更新 remote-tracking(命令行简写只进 FETCH_HEAD)
+          git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+          git reset --hard "origin/${BRANCH}"
+          git fetch upstream
+          git fetch upstream --tags
+
+      - name: Rebase onto upstream/${{ env.BRANCH }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rebase "upstream/${BRANCH}"; then
+            echo "rebase ok"
+          else
+            echo "::error::rebase conflict — resolve manually and rerun"
+            git rebase --abort
+            exit 1
+          fi
+
+      - name: Push (PAT required, GITHUB_TOKEN cannot push workflow changes)
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$PAT_TOKEN" || { echo "::error::缺少 secret PAT_TOKEN(需 repo+workflow 权限)"; exit 1; }
+          repo="https://x-access-token:${PAT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # 显式期望值:ls-remote 实时读远程,不依赖本地 tracking 状态
+          expected="$(git ls-remote "$repo" "refs/heads/${BRANCH}" | cut -f1)"
+          test -n "$expected" || { echo "::error::ls-remote 未返回 ${BRANCH}"; exit 1; }
+          git push --force-with-lease="${BRANCH}:${expected}" "$repo" "$BRANCH"
+          # 把上游 tags 推到 fork:后续 iOS CLI 的 checkout ref=<tag> 从本仓库拉取
+          git push "$repo" --tags
+
+      - name: Check for unreleased upstream tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 只跟随 stable 分支可达的 tag:tag 提交必须是 upstream/stable 的祖先,
+          # dev/testing 线上的 -alpha/-beta tag 不触发编译
+          new_tag=""
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            if ! git merge-base --is-ancestor "$(git rev-parse "$tag")" "upstream/${BRANCH}"; then
+              continue
+            fi
+            # -R 必须显式指定:双 remote(origin+upstream)下 gh 默认解析到 upstream,
+            # 会查到上游的 release 而误判"已发布"
+            if ! gh release view -R "$GITHUB_REPOSITORY" "$tag" >/dev/null 2>&1; then
+              new_tag="$tag"
+              break
+            fi
+          done < <(git for-each-ref --sort=-v:refname --format='%(refname:short)' 'refs/tags/v*')
+          echo "stable unreleased tag: ${new_tag:-none}"
+          echo "new_tag=${new_tag}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release-ios-cli:
+    name: Release iOS CLI for new tag
+    needs: sync
+    if: needs.sync.outputs.new_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/ios-cli.yml
+    with:
+      ref: ${{ needs.sync.outputs.new_tag }}
+      release: true
