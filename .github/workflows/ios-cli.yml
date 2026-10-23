@@ -1,0 +1,183 @@
+name: iOS CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref (tag / branch / commit)"
+        required: true
+        default: "stable"
+      release:
+        description: "Create GitHub release for the tag"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: "stable"
+      release:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out (${{ inputs.ref }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Select newest Xcode
+        run: |
+          latest="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort -V | tail -n1)"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-macos-ios-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-macos-ios-
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(git describe --tags --abbrev=0 | sed 's/^v//')"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install packaging tools
+        run: brew install dpkg ldid
+
+      - name: Build and package debs
+        env:
+          GOOS: ios
+          GOARCH: arm64
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          # dpkg sorts '~' before everything: 1.15.0~alpha.12 < 1.15.0
+          deb_version="${version//-/\~}"
+          mkdir -p dist
+
+          # -extldflags=-dead_strip: libcronet.a's ios_arm64 slice references
+          # Chromium symbols that iOS drops; harmless for the min build.
+          ldflags="-X 'github.com/sagernet/sing-box/constant.Version=${version}' $(cat release/LDFLAGS) -s -w -buildid= -extldflags=-dead_strip"
+          base_tags="$(cat release/DEFAULT_BUILD_TAGS)"
+
+          # The firmware floor decides both the deployment target and the feature
+          # set: naive (cronet-go) needs iOS 15, so older floors are built
+          # without with_naive_outbound.
+          build_for_floor() { # <firmware floor> -> binary path
+            local floor="$1" target tags name binary
+            if [ "${floor%%.*}" -lt 15 ]; then
+              target="12.0"
+              tags="${base_tags//,with_naive_outbound/},with_gvisor"
+              name="ios-min"
+            else
+              target="15.0"
+              tags="${base_tags},with_gvisor"
+              name="ios"
+            fi
+            binary="dist/sing-box-${version}-${name}"
+            if [ ! -x "$binary" ]; then
+              IPHONEOS_DEPLOYMENT_TARGET="$target" \
+              CGO_CFLAGS="-miphoneos-version-min=${target}" \
+              CGO_LDFLAGS="-miphoneos-version-min=${target}" \
+              CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=${target}" \
+                go build -v -trimpath -tags "$tags" -ldflags "$ldflags" -o "$binary" ./cmd/sing-box >&2
+            fi
+            printf '%s\n' "$binary"
+          }
+
+          entitlements=/tmp/sing-box-entitlements.plist
+          cat > "$entitlements" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>com.apple.private.security.no-sandbox</key>
+          	<true/>
+          </dict>
+          </plist>
+          PLIST
+
+          export COPYFILE_DISABLE=1
+
+          build_deb() { # <prefix> <dpkg architecture> <firmware floor>
+            local prefix="$1" architecture="$2" firmware_floor="$3"
+            local binary root out installed_size
+            binary="$(build_for_floor "$firmware_floor")"
+            root="pkg/debroot-${architecture}"
+            out="dist/sing-box-cli_${deb_version}_${architecture}.deb"
+
+            rm -rf "$root"
+            mkdir -p "${root}${prefix}/usr/bin" "${root}/DEBIAN"
+            install -m 755 "$binary" "${root}${prefix}/usr/bin/sing-box"
+            ldid -S"$entitlements" "${root}${prefix}/usr/bin/sing-box"
+
+            find "$root" -print0 | xargs -0 xattr -c 2>/dev/null || true
+            find "$root" -name '._*' -delete
+            find "$root" -name '.DS_Store' -delete
+
+            installed_size="$(du -ks "$root" | cut -f1)"
+            cat > "${root}/DEBIAN/control" <<CTRL
+          Package: sing-box-cli
+          Name: sing-box CLI
+          Version: ${deb_version}
+          Architecture: ${architecture}
+          Installed-Size: ${installed_size}
+          Description: sing-box command line for jailbroken iOS (root TUN), built from upstream ${version}
+          Maintainer: fork CI
+          Author: SagerNet
+          Section: System
+          Depends: firmware (>= ${firmware_floor})
+          CTRL
+
+            dpkg-deb --root-owner-group -Zxz -z9 -Sextreme --build "$root" "$out"
+          }
+
+          build_deb ""        iphoneos-arm64e 15.0
+          build_deb "/var/jb" iphoneos-arm64  15.0
+          build_deb ""        iphoneos-arm    12.0
+
+          file dist/sing-box-*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-ios-cli
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Release
+        if: inputs.release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "sing-box ${VERSION} (iOS CLI)" \
+              --notes "Automated build of upstream ${tag} for iOS (rootless/roothide, plus iOS 12 rootful without naive)."
+          fi
+          gh release upload "$tag" dist/*.deb --clobber
