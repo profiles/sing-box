@@ -1,0 +1,177 @@
+name: iOS CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref (tag / branch / commit)"
+        required: true
+        default: "stable"
+      release:
+        description: "Create GitHub release for the tag"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: "stable"
+      release:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out (${{ inputs.ref }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Select newest Xcode
+        run: |
+          latest="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort -V | tail -n1)"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-macos-ios-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-macos-ios-
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(git describe --tags --abbrev=0 | sed 's/^v//')"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set build tags + ldflags (per upstream build_darwin)
+        run: |
+          set -euo pipefail
+          # 官方 darwin CLI 用 release/DEFAULT_BUILD_TAGS;with_gvisor 为 iOS TUN 追加
+          # (官方 darwin CLI 用 system 栈不带 gvisor)
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS),with_gvisor" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+
+      - name: Build sing-box (ios/arm64)
+        # -extldflags=-dead_strip:cronet-go 的 ios_arm64 预编译库带悬空引用
+        # (Chromium iOS 裁掉 message_pump_kqueue.cc,features.o 仍引用其 InitializeFeatures)。
+        # SFI 经 gomobile c-archive + Xcode(默认 dead_strip)构建,同一机制绕过;
+        # CLI 全量链接须显式开启,且 Go 代码兼容性已被 SFI 海量运行验证。
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
+          CC="xcrun -sdk iphoneos clang -arch arm64" \
+          go build -v -trimpath -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ steps.version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid= -extldflags=-dead_strip" \
+            -o "dist/sing-box-${{ steps.version.outputs.version }}-ios-arm64" ./cmd/sing-box
+          file "dist/sing-box-${{ steps.version.outputs.version }}-ios-arm64"
+
+      - name: Install packaging tools
+        run: brew install dpkg ldid
+
+      - name: Package (tarball + debs, per upstream Jailbreak/package.sh)
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          BIN="dist/sing-box-${VERSION}-ios-arm64"
+
+          # entitlement: roothide/dopamine 沙盒下 CLI 读配置、建 TUN 需要它(实测)
+          cat > /tmp/sb-ent.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>com.apple.private.security.no-sandbox</key>
+          	<true/>
+          </dict>
+          </plist>
+          PLIST
+
+          export COPYFILE_DISABLE=1
+
+          # dpkg sorts '~' before everything: 1.15.0~alpha.12 < 1.15.0(官方同款处理)
+          TILDE="~"
+          DEB_VERSION="${VERSION//-/$TILDE}"
+
+          build_deb() {
+            prefix="$1"; architecture="$2"
+            deb_root="pkg/debroot-${architecture}"
+            deb_out="dist/sing-box-cli_${DEB_VERSION}_${architecture}.deb"
+
+            rm -rf "$deb_root"
+            mkdir -p "${deb_root}${prefix}/usr/bin" "${deb_root}/DEBIAN"
+            install -m 755 "${BIN}" "${deb_root}${prefix}/usr/bin/sing-box"
+            ldid -S/tmp/sb-ent.plist "${deb_root}${prefix}/usr/bin/sing-box"
+
+            find "$deb_root" -print0 | xargs -0 xattr -c 2>/dev/null || true
+            find "$deb_root" -name '._*' -delete
+            find "$deb_root" -name '.DS_Store' -delete
+
+            INSTALLED_SIZE="$(du -ks "$deb_root" | cut -f1)"
+            cat > "${deb_root}/DEBIAN/control" <<CTRL
+          Package: sing-box-cli
+          Name: sing-box CLI
+          Version: ${DEB_VERSION}
+          Architecture: ${architecture}
+          Installed-Size: ${INSTALLED_SIZE}
+          Description: sing-box command line for jailbroken iOS (root TUN), built from upstream ${VERSION}
+          Maintainer: fork CI
+          Author: SagerNet
+          Section: System
+          Depends: firmware (>= 15.0)
+          CTRL
+
+            ( cd "$deb_root" && find . -type f ! -path './DEBIAN/*' | sed 's|^\./||' | LC_ALL=C sort \
+              | while IFS= read -r f; do printf '%s  %s\n' "$(md5 -q "$f")" "$f"; done ) > "${deb_root}/DEBIAN/md5sums"
+            chmod 644 "${deb_root}/DEBIAN/md5sums"
+
+            dpkg-deb --root-owner-group -Zxz -z9 -Sextreme --build "$deb_root" "$deb_out"
+          }
+
+          build_deb /var/jb iphoneos-arm64
+          build_deb "" iphoneos-arm64e
+
+          (cd dist && shasum -a 256 ./*.deb | tee SHA256SUMS)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-ios-arm64
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Release
+        if: inputs.release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "sing-box ${VERSION} (iOS CLI)" \
+              --notes "Automated build of upstream ${tag} for iOS (arm64, root CLI, GOOS=ios + cgo)."
+          fi
+          gh release upload "$tag" dist/*.deb dist/SHA256SUMS --clobber
